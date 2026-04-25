@@ -27,6 +27,7 @@ const RECONNECT_WATCHDOG_MS = 20000
 const ALREADY_LOGGED_IN_RECONNECT_DELAY_MS = 3000
 const ALREADY_LOGGED_IN_MAX_RETRIES = 3
 const AFK_ANTI_IDLE_MS = 45000
+const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 1000))
 const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
 const AFK_DRIFT_DISTANCE = 24
@@ -435,6 +436,13 @@ const state = {
   afkAnchorCapturedAt: null,
   lastRejoinAt: null,
   lastActivityAt: null,
+  authInputInterval: null,
+  authInputTick: 0n,
+  authInputPacketCount: 0,
+  authInputConsecutiveErrors: 0,
+  pitch: 0,
+  yaw: 0,
+  headYaw: 0,
   scoreboardEntryMap: new Map(),
   scoreboardObjectiveMap: new Map(),
   scoreboardEntries: [],
@@ -594,11 +602,19 @@ function clearReconnectWatchdogTimeout() {
   }
 }
 
+function clearAuthInputLoop() {
+  if (state.authInputInterval) {
+    clearInterval(state.authInputInterval)
+    state.authInputInterval = null
+  }
+}
+
 function resetJoinState({ keepSuccess = false } = {}) {
   clearAfkTimeout()
   clearSpawnCommandTimeout()
   clearAnchorTimeout()
   clearReconnectWatchdogTimeout()
+  clearAuthInputLoop()
   stopLocalPlaytimeSession()
   state.spawned = false
   state.afkAttemptInFlight = false
@@ -609,6 +625,12 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.afkAnchorPosition = null
   state.afkAnchorCapturedAt = null
   state.lastActivityAt = null
+  state.authInputTick = 0n
+  state.authInputPacketCount = 0
+  state.authInputConsecutiveErrors = 0
+  state.pitch = 0
+  state.yaw = 0
+  state.headYaw = 0
   state.scoreboardEntryMap = new Map()
   state.scoreboardObjectiveMap = new Map()
   state.scoreboardEntries = []
@@ -639,6 +661,86 @@ function compactReason(reason, maxLength = 48) {
     .trim()
     .toUpperCase()
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
+}
+
+function coerceTick(value, fallback = 0n) {
+  if (typeof value === 'bigint') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.max(0, Math.floor(value)))
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value)
+  return fallback
+}
+
+function authInputTickStep() {
+  return BigInt(Math.max(1, Math.round(AFK_AUTH_INPUT_MS / 50)))
+}
+
+function updateRotation(params = {}) {
+  if (Number.isFinite(Number(params.pitch))) state.pitch = Number(params.pitch)
+  if (Number.isFinite(Number(params.yaw))) state.yaw = Number(params.yaw)
+  if (Number.isFinite(Number(params.head_yaw))) state.headYaw = Number(params.head_yaw)
+  else if (Number.isFinite(Number(params.headYaw))) state.headYaw = Number(params.headYaw)
+  else state.headYaw = state.yaw
+}
+
+function buildAuthInputPacket() {
+  const position = clonePosition(state.currentPosition)
+  if (!position) return null
+
+  return {
+    pitch: state.pitch || 0,
+    yaw: state.yaw || 0,
+    position,
+    move_vector: { x: 0, z: 0 },
+    head_yaw: state.headYaw || state.yaw || 0,
+    input_data: {},
+    input_mode: 'mouse',
+    play_mode: 'normal',
+    interaction_model: 'crosshair',
+    interact_rotation: { x: 0, z: 0 },
+    tick: state.authInputTick,
+    delta: { x: 0, y: 0, z: 0 },
+    analogue_move_vector: { x: 0, z: 0 },
+    camera_orientation: { x: 0, y: 0, z: 0 },
+    raw_move_vector: { x: 0, z: 0 }
+  }
+}
+
+function sendAuthInputHeartbeat(reason = 'interval') {
+  if (!state.spawned || state.reconnecting || state.shuttingDown) return false
+  if (!state.client || state.client.entityId == null) return false
+
+  const packet = buildAuthInputPacket()
+  if (!packet) return false
+
+  try {
+    state.client.queue('player_auth_input', packet)
+    state.authInputTick += authInputTickStep()
+    state.authInputPacketCount += 1
+    state.authInputConsecutiveErrors = 0
+    state.lastActivityAt = new Date().toISOString()
+
+    if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % 60 === 0) {
+      log(`[AFK] [AUTH_INPUT] [COUNT:${state.authInputPacketCount}] [TICK:${packet.tick}] [POS:${formatPosition(packet.position)}] [REASON:${reason}]`)
+    }
+    return true
+  } catch (err) {
+    state.authInputConsecutiveErrors += 1
+    log(`[AFK] [AUTH_INPUT_FAIL] [COUNT:${state.authInputConsecutiveErrors}] [REASON:${compactReason(err.message, 48)}]`)
+    if (state.authInputConsecutiveErrors >= 3) {
+      clearAuthInputLoop()
+      log('[AFK] [AUTH_INPUT_DISABLED] repeated serializer/write failures')
+    }
+    return false
+  }
+}
+
+function startAuthInputLoop(reason = 'spawn') {
+  if (state.authInputInterval) return
+  sendAuthInputHeartbeat(reason)
+  state.authInputInterval = setInterval(() => {
+    sendAuthInputHeartbeat('interval')
+  }, AFK_AUTH_INPUT_MS)
+  log(`[AFK] [AUTH_INPUT_LOOP] [STARTED] [EVERY:${AFK_AUTH_INPUT_MS}ms] [REASON:${reason}]`)
 }
 
 function clampDisplayText(value, fallback = 'UNKNOWN') {
@@ -1604,6 +1706,11 @@ function updateCurrentPosition(position, source = 'unknown') {
   }
 }
 
+function updateCurrentPose(params = {}, source = 'unknown') {
+  updateRotation(params)
+  updateCurrentPosition(params.position || params.player_position, source)
+}
+
 function canTriggerRejoinNow() {
   if (state.afkAttemptInFlight || state.reconnecting || state.shuttingDown) return false
   if (!state.lastRejoinAt) return true
@@ -1923,6 +2030,7 @@ function createAndWireClient() {
 
   client.on('close', (...args) => {
     clearReconnectWatchdogTimeout()
+    clearAuthInputLoop()
     log('[EVENT] [CLOSE]')
     if (args.length) log(`[DETAIL] ${inspect(args)}`)
     state.client = null
@@ -1931,6 +2039,7 @@ function createAndWireClient() {
 
   client.on('disconnect', packet => {
     clearReconnectWatchdogTimeout()
+    clearAuthInputLoop()
     const reason = packet?.message || packet?.reason || 'unknown'
     log(`[DISCONNECT] [REASON:${compactReason(reason, 36)}]`)
     log(`[DETAIL] ${inspect(packet)}`)
@@ -1946,6 +2055,7 @@ function createAndWireClient() {
 
   client.on('error', err => {
     clearReconnectWatchdogTimeout()
+    clearAuthInputLoop()
     log(`[ERROR] [CLIENT] [REASON:${compactReason(err?.message || err, 36)}]`)
     log(`[DETAIL] ${inspect(err)}`)
     helper.saveSnapshot('error', {
@@ -1992,7 +2102,13 @@ function createAndWireClient() {
       clearReconnectWatchdogTimeout()
       log(`[PKT] [START_GAME] [EID:${params.runtime_entity_id}]`)
       client.startGameData = params
-      updateCurrentPosition(params.player_position, 'start_game')
+      state.authInputTick = coerceTick(params.current_tick, state.authInputTick)
+      updateCurrentPose({
+        position: params.player_position,
+        pitch: params.rotation?.x ?? params.pitch,
+        yaw: params.rotation?.y ?? params.yaw,
+        head_yaw: params.rotation?.y ?? params.head_yaw
+      }, 'start_game')
       helper.sendInitializedOnce('start_game')
     }
 
@@ -2003,6 +2119,7 @@ function createAndWireClient() {
         state.alreadyLoggedInRetries = 0
         startLocalPlaytimeSession()
         helper.sendInitializedOnce('player_spawn')
+        startAuthInputLoop('player_spawn')
         state.waitingForAutoAssign = true
         clearSpawnCommandTimeout()
         state.spawnCommandTimeout = setTimeout(() => {
@@ -2038,11 +2155,16 @@ function createAndWireClient() {
     if (name === 'move_player') {
       const runtimeId = params.runtime_id ?? params.runtime_entity_id
       if (client.entityId != null && String(runtimeId) === String(client.entityId)) {
-        updateCurrentPosition(params.position, `move_player:${params.mode || 'unknown'}`)
+        updateCurrentPose(params, `move_player:${params.mode || 'unknown'}`)
         checkAfkPositionDrift(`move_player:${params.mode || 'unknown'}`)
       } else {
         updatePlayerEntityPosition(params)
       }
+    }
+
+    if (name === 'correct_player_move_prediction') {
+      state.authInputTick = coerceTick(params.tick, state.authInputTick)
+      updateCurrentPosition(params.position, 'correct_player_move_prediction')
     }
 
     if (name === 'set_display_objective') {
@@ -2177,6 +2299,7 @@ process.on('SIGINT', () => {
   clearAnchorTimeout()
   clearReconnectTimeout()
   clearReconnectWatchdogTimeout()
+  clearAuthInputLoop()
   helper.saveSnapshot('sigint', {
     afk_state: {
       area: state.currentTargetArea,
@@ -2221,6 +2344,7 @@ if (CLOUD_MODE) {
     log(`[CLOUD] [AUTO_EXIT] [ELAPSED:${durationSec}s] [REASON:DURATION_REACHED]`)
     state.shuttingDown = true
     stopLocalPlaytimeSession()
+    clearAuthInputLoop()
     try { state.client?.close() } catch {}
     await flushCloudQueue()
     setTimeout(() => process.exit(0), 1500)
@@ -2232,6 +2356,7 @@ process.on('SIGTERM', async () => {
   log('[CLOUD] [SIGTERM] Graceful shutdown')
   state.shuttingDown = true
   stopLocalPlaytimeSession()
+  clearAuthInputLoop()
   try { state.client?.close() } catch {}
   await flushCloudQueue()
   setTimeout(() => process.exit(0), 1500)
