@@ -24,6 +24,9 @@ const AFK_RESULT_TIMEOUT_MS = 8000
 const HEARTBEAT_MS = 30000
 const RECONNECT_DELAY_MS = 10000
 const RECONNECT_WATCHDOG_MS = Math.max(30000, Number(process.env.RECONNECT_WATCHDOG_MS || 90000))
+const RAKNET_CONNECT_WATCHDOG_MS = Math.max(8000, Number(process.env.RAKNET_CONNECT_WATCHDOG_MS || 20000))
+const LOGIN_PROGRESS_WATCHDOG_MS = Math.max(15000, Number(process.env.LOGIN_PROGRESS_WATCHDOG_MS || 30000))
+const WATCHDOG_RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.WATCHDOG_RECONNECT_DELAY_MS || 3000))
 const CONNECT_TIMEOUT_MS = Math.max(15000, Number(process.env.CONNECT_TIMEOUT_MS || 60000))
 const ALREADY_LOGGED_IN_RECONNECT_DELAY_MS = 3000
 const ALREADY_LOGGED_IN_MAX_RETRIES = 3
@@ -428,6 +431,7 @@ const state = {
   anchorTimeout: null,
   reconnectTimeout: null,
   reconnectWatchdogTimeout: null,
+  reconnectWatchdogReason: null,
   lastConnectProgressAt: null,
   connectPhase: 'idle',
   reconnecting: false,
@@ -619,6 +623,12 @@ function markConnectProgress(phase) {
   state.connectPhase = phase
 }
 
+function getReconnectWatchdogLimitMs() {
+  if (state.connectPhase === 'auth_session') return RAKNET_CONNECT_WATCHDOG_MS
+  if (state.connectPhase === 'login_sent') return LOGIN_PROGRESS_WATCHDOG_MS
+  return RECONNECT_WATCHDOG_MS
+}
+
 function scheduleReconnectWatchdog(client) {
   clearReconnectWatchdogTimeout()
   state.reconnectWatchdogTimeout = setTimeout(() => {
@@ -629,16 +639,18 @@ function scheduleReconnectWatchdog(client) {
 
     const lastProgressAt = state.lastConnectProgressAt || 0
     const idleMs = Date.now() - lastProgressAt
-    if (idleMs < RECONNECT_WATCHDOG_MS) {
+    const watchdogMs = getReconnectWatchdogLimitMs()
+    if (idleMs < watchdogMs) {
       scheduleReconnectWatchdog(client)
       return
     }
 
-    log(`[RECONNECT] [WATCHDOG] [TIMEOUT:${Math.floor(RECONNECT_WATCHDOG_MS / 1000)}s] [PHASE:${state.connectPhase || 'unknown'}] [ACTION:CLOSE]`)
+    state.reconnectWatchdogReason = `watchdog:${state.connectPhase || 'unknown'}`
+    log(`[RECONNECT] [WATCHDOG] [TIMEOUT:${Math.floor(watchdogMs / 1000)}s] [PHASE:${state.connectPhase || 'unknown'}] [ACTION:CLOSE]`)
     try {
       client.close()
     } catch {}
-  }, Math.min(RECONNECT_WATCHDOG_MS, 15000))
+  }, Math.min(getReconnectWatchdogLimitMs(), 5000))
 }
 
 function clearAuthInputLoop() {
@@ -2052,7 +2064,9 @@ function sendAntiIdle(reason = 'interval') {
 function scheduleReconnect(reason) {
   if (state.shuttingDown || state.reconnecting || state.reconnectTimeout) return
 
-  const alreadyLoggedIn = isAlreadyLoggedInReason(reason)
+  const watchdogReason = state.reconnectWatchdogReason
+  const reconnectReason = (String(reason || '').toLowerCase() === 'close' && watchdogReason) ? watchdogReason : reason
+  const alreadyLoggedIn = isAlreadyLoggedInReason(reconnectReason)
   if (alreadyLoggedIn) {
     state.alreadyLoggedInRetries += 1
     if (state.alreadyLoggedInRetries > ALREADY_LOGGED_IN_MAX_RETRIES) {
@@ -2075,9 +2089,14 @@ function scheduleReconnect(reason) {
   state.reconnecting = true
   state.reconnectAttempt += 1
   resetJoinState()
+  state.reconnectWatchdogReason = null
   state.client = null
-  const reconnectDelay = alreadyLoggedIn ? ALREADY_LOGGED_IN_RECONNECT_DELAY_MS : RECONNECT_DELAY_MS
-  log(`[RECONNECT] [SCHEDULED] [ATTEMPT:${state.reconnectAttempt}] [IN:${Math.floor(reconnectDelay / 1000)}s] [REASON:${compactReason(reason, 28)}]`)
+  const reconnectDelay = alreadyLoggedIn
+    ? ALREADY_LOGGED_IN_RECONNECT_DELAY_MS
+    : watchdogReason
+      ? WATCHDOG_RECONNECT_DELAY_MS
+      : RECONNECT_DELAY_MS
+  log(`[RECONNECT] [SCHEDULED] [ATTEMPT:${state.reconnectAttempt}] [IN:${Math.floor(reconnectDelay / 1000)}s] [REASON:${compactReason(reconnectReason, 28)}]`)
   state.reconnectTimeout = setTimeout(() => {
     state.reconnectTimeout = null
     createAndWireClient()
@@ -2088,6 +2107,7 @@ function createAndWireClient() {
   clearReconnectTimeout()
   clearReconnectWatchdogTimeout()
   state.reconnecting = false
+  state.reconnectWatchdogReason = null
 
   const hasProxy = Boolean(process.env.PROXY_HOST)
   const clientOptions = {
