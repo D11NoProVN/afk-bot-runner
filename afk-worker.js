@@ -27,7 +27,8 @@ const RECONNECT_WATCHDOG_MS = 20000
 const ALREADY_LOGGED_IN_RECONNECT_DELAY_MS = 3000
 const ALREADY_LOGGED_IN_MAX_RETRIES = 3
 const AFK_ANTI_IDLE_MS = 45000
-const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 1000))
+const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 50))
+const AFK_AUTH_INPUT_LOG_EVERY = Math.max(1, Number(process.env.AFK_AUTH_INPUT_LOG_EVERY || 1200))
 const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
 const AFK_DRIFT_DISTANCE = 24
@@ -719,7 +720,7 @@ function sendAuthInputHeartbeat(reason = 'interval') {
     state.authInputConsecutiveErrors = 0
     state.lastActivityAt = new Date().toISOString()
 
-    if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % 60 === 0) {
+    if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % AFK_AUTH_INPUT_LOG_EVERY === 0) {
       log(`[AFK] [AUTH_INPUT] [COUNT:${state.authInputPacketCount}] [TICK:${packet.tick}] [POS:${formatPosition(packet.position)}] [REASON:${reason}]`)
     }
     return true
