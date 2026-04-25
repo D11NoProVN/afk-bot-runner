@@ -29,6 +29,8 @@ const ALREADY_LOGGED_IN_MAX_RETRIES = 3
 const AFK_ANTI_IDLE_MS = 45000
 const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 50))
 const AFK_AUTH_INPUT_LOG_EVERY = Math.max(1, Number(process.env.AFK_AUTH_INPUT_LOG_EVERY || 1200))
+const AFK_MOVEMENT_PACKET_MODE = String(process.env.AFK_MOVEMENT_PACKET_MODE || 'hybrid').toLowerCase()
+const AFK_TICK_SYNC_EVERY = Math.max(1, Number(process.env.AFK_TICK_SYNC_EVERY || 10))
 const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
 const AFK_DRIFT_DISTANCE = 24
@@ -441,6 +443,8 @@ const state = {
   authInputTick: 0n,
   authInputPacketCount: 0,
   authInputConsecutiveErrors: 0,
+  pendingTeleportAckPackets: 0,
+  movementAuthority: null,
   pitch: 0,
   yaw: 0,
   headYaw: 0,
@@ -629,6 +633,8 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.authInputTick = 0n
   state.authInputPacketCount = 0
   state.authInputConsecutiveErrors = 0
+  state.pendingTeleportAckPackets = 0
+  state.movementAuthority = null
   state.pitch = 0
   state.yaw = 0
   state.headYaw = 0
@@ -683,9 +689,31 @@ function updateRotation(params = {}) {
   else state.headYaw = state.yaw
 }
 
+function blockPositionFromPosition(position) {
+  return {
+    x: Math.floor(Number(position?.x) || 0),
+    y: Math.floor(Number(position?.y) || 0),
+    z: Math.floor(Number(position?.z) || 0)
+  }
+}
+
+function shouldSendAuthInput() {
+  return AFK_MOVEMENT_PACKET_MODE === 'hybrid' ||
+    AFK_MOVEMENT_PACKET_MODE === 'auth' ||
+    (AFK_MOVEMENT_PACKET_MODE === 'auto' && state.movementAuthority !== 'client')
+}
+
+function shouldSendMovePlayer() {
+  return AFK_MOVEMENT_PACKET_MODE === 'hybrid' ||
+    AFK_MOVEMENT_PACKET_MODE === 'move' ||
+    (AFK_MOVEMENT_PACKET_MODE === 'auto' && state.movementAuthority === 'client')
+}
+
 function buildAuthInputPacket() {
   const position = clonePosition(state.currentPosition)
   if (!position) return null
+  const inputData = { received_server_data: true }
+  if (state.pendingTeleportAckPackets > 0) inputData.handled_teleport = true
 
   return {
     pitch: state.pitch || 0,
@@ -693,7 +721,7 @@ function buildAuthInputPacket() {
     position,
     move_vector: { x: 0, z: 0 },
     head_yaw: state.headYaw || state.yaw || 0,
-    input_data: {},
+    input_data: inputData,
     input_mode: 'mouse',
     play_mode: 'normal',
     interaction_model: 'crosshair',
@@ -706,22 +734,63 @@ function buildAuthInputPacket() {
   }
 }
 
+function buildMovePlayerPacket() {
+  const position = clonePosition(state.currentPosition)
+  if (!position || !state.client || state.client.entityId == null) return null
+  return {
+    runtime_id: Number(state.client.entityId),
+    position,
+    pitch: state.pitch || 0,
+    yaw: state.yaw || 0,
+    head_yaw: state.headYaw || state.yaw || 0,
+    mode: 'normal',
+    on_ground: true,
+    ridden_runtime_id: 0,
+    tick: state.authInputTick
+  }
+}
+
+function sendTeleportAckIfNeeded() {
+  if (state.pendingTeleportAckPackets <= 0) return
+  if (!state.client || state.client.entityId == null || !state.currentPosition) return
+
+  try {
+    const blockPosition = blockPositionFromPosition(state.currentPosition)
+    state.client.queue('player_action', {
+      runtime_entity_id: BigInt(state.client.entityId),
+      action: 'handled_teleport',
+      position: blockPosition,
+      result_position: blockPosition,
+      face: 0
+    })
+  } catch (err) {
+    log(`[AFK] [TELEPORT_ACK_FAIL] [REASON:${compactReason(err.message, 48)}]`)
+  }
+}
+
 function sendAuthInputHeartbeat(reason = 'interval') {
   if (!state.spawned || state.reconnecting || state.shuttingDown) return false
   if (!state.client || state.client.entityId == null) return false
 
   const packet = buildAuthInputPacket()
-  if (!packet) return false
+  const movePacket = buildMovePlayerPacket()
+  if (!packet && !movePacket) return false
 
   try {
-    state.client.queue('player_auth_input', packet)
+    sendTeleportAckIfNeeded()
+    if (packet && shouldSendAuthInput()) state.client.queue('player_auth_input', packet)
+    if (movePacket && shouldSendMovePlayer()) state.client.queue('move_player', movePacket)
+    if (state.authInputPacketCount % AFK_TICK_SYNC_EVERY === 0) {
+      state.client.queue('tick_sync', { request_time: state.authInputTick, response_time: 0n })
+    }
     state.authInputTick += authInputTickStep()
     state.authInputPacketCount += 1
+    if (state.pendingTeleportAckPackets > 0) state.pendingTeleportAckPackets -= 1
     state.authInputConsecutiveErrors = 0
     state.lastActivityAt = new Date().toISOString()
 
     if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % AFK_AUTH_INPUT_LOG_EVERY === 0) {
-      log(`[AFK] [AUTH_INPUT] [COUNT:${state.authInputPacketCount}] [TICK:${packet.tick}] [POS:${formatPosition(packet.position)}] [REASON:${reason}]`)
+      log(`[AFK] [MOVE_HEARTBEAT] [COUNT:${state.authInputPacketCount}] [TICK:${state.authInputTick}] [MODE:${AFK_MOVEMENT_PACKET_MODE}] [AUTHORITY:${state.movementAuthority || 'unknown'}] [POS:${formatPosition(state.currentPosition)}] [REASON:${reason}]`)
     }
     return true
   } catch (err) {
@@ -941,12 +1010,12 @@ function getScoreboardStats() {
   })
   const playtime = extractPlaytimeStat()
   const localSeconds = getLocalPlaytimeSeconds()
+  const serverSeconds = playtime?.seconds ?? null
 
   // Ưu tiên server value (nếu parse được seconds), fallback sang local
-  const displaySeconds = (playtime?.seconds != null && playtime.seconds > 0)
-    ? playtime.seconds
-    : localSeconds
-  const displayValue = playtime?.value || formatDurationHuman(localSeconds)
+  const displaySeconds = Math.max(Number(serverSeconds) || 0, Number(localSeconds) || 0)
+  const displayValue = formatDurationHuman(displaySeconds)
+  const displaySource = (serverSeconds != null && serverSeconds >= localSeconds) ? 'server' : 'local'
 
   return {
     money: {
@@ -969,9 +1038,9 @@ function getScoreboardStats() {
       value: displayValue,
       raw: playtime?.raw ?? null,
       seconds: displaySeconds,
-      serverSeconds: playtime?.seconds ?? null,
+      serverSeconds,
       localSeconds,
-      source: (playtime?.seconds != null && playtime.seconds > 0) ? 'server' : 'local'
+      source: displaySource
     }
   }
 }
@@ -2113,6 +2182,11 @@ function createAndWireClient() {
       helper.sendInitializedOnce('start_game')
     }
 
+    if (name === 'set_movement_authority') {
+      state.movementAuthority = params.movement_authority || null
+      log(`[PKT] [MOVEMENT_AUTHORITY] [${String(state.movementAuthority || 'unknown').toUpperCase()}]`)
+    }
+
     if (name === 'play_status') {
       log(`[PKT] [PLAY_STATUS] [${String(params.status || 'unknown').toUpperCase()}]`)
       if (params.status === 'player_spawn' && !state.spawned) {
@@ -2156,6 +2230,11 @@ function createAndWireClient() {
     if (name === 'move_player') {
       const runtimeId = params.runtime_id ?? params.runtime_entity_id
       if (client.entityId != null && String(runtimeId) === String(client.entityId)) {
+        state.authInputTick = coerceTick(params.tick, state.authInputTick)
+        if (params.mode === 'teleport' || params.mode === 'reset') {
+          state.pendingTeleportAckPackets = Math.max(state.pendingTeleportAckPackets, 20)
+          log(`[AFK] [TELEPORT_ACK_PENDING] [MODE:${params.mode}] [PACKETS:${state.pendingTeleportAckPackets}]`)
+        }
         updateCurrentPose(params, `move_player:${params.mode || 'unknown'}`)
         checkAfkPositionDrift(`move_player:${params.mode || 'unknown'}`)
       } else {
