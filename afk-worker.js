@@ -176,7 +176,7 @@ function createBot() {
     }, 500)
     
     // Bắt đầu báo cáo shard định kỳ khi đã vào game
-    startShardReporting()
+    startReporting()
   })
 
   bot.on('resourcePack', () => {
@@ -265,7 +265,7 @@ function createBot() {
 
   bot.on('end', () => {
     log(`${time()} ${chalk.red('✖ Disconnected. Reconnecting in 10s...')}`)
-    stopShardReporting()
+    stopReporting()
     setTimeout(createBot, 10000)
   })
 
